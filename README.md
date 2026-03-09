@@ -1,7 +1,7 @@
 # TDSB Junior School Map
 
 Scrapes the Toronto District School Board website for all elementary schools and
-produces a KML file ready to import into [Google My Maps](https://mymaps.google.com).
+produces a KML file ready to import into Google My Maps.
 
 Each school page (e.g. [Blake Street Junior Public School](https://www.tdsb.on.ca/Find-your/School/By-Map/focusonschool/5287))
 contains an embedded Google Map with a pin and a catchment boundary polygon.
