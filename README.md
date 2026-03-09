@@ -41,3 +41,7 @@ the school name.
 On first run the script fetches the school list from the TDSB API and saves it
 as `schools.xml`. Subsequent runs use this cache automatically. Delete it to
 re-fetch fresh data.
+
+---------------------------------------
+
+_This project was 100% vibe coded with Claude Code. Level 💛¹_
