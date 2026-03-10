@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from shapely.geometry import Polygon as ShapelyPolygon
+from shapely.ops import unary_union
 
 SCHOOLS_API = (
     "https://www.tdsb.on.ca/DesktopModules/Tdsb.Webteam.Modules.SchoolSearchMap/"
@@ -107,6 +108,77 @@ def fetch_boundary(school, client):
     return rings
 
 
+def classify_rings(rings):
+    """Classify raw rings into (exterior_ring, [hole_rings]) polygon specs.
+
+    Rings that are fully contained within a larger ring are treated as holes
+    (e.g. excluded apartment buildings).  Rings that are not contained within
+    any other ring are treated as separate exterior components (e.g. a
+    school catchment split by a highway).
+
+    Returns a list of (exterior_coords, [hole_coords, ...]) tuples.
+    """
+    if not rings:
+        return []
+    if len(rings) == 1:
+        return [(rings[0], [])]
+
+    valid = []
+    for ring in rings:
+        if len(ring) < 3:
+            continue
+        try:
+            sp = ShapelyPolygon([(lng, lat) for lat, lng in ring])
+            if sp.is_valid and not sp.is_empty and sp.area > 0:
+                valid.append((ring, sp))
+        except Exception:
+            pass
+
+    if not valid:
+        return [(r, []) for r in rings]
+
+    # Largest rings first — they are the candidates for outer boundaries.
+    valid.sort(key=lambda x: -x[1].area)
+
+    exteriors = []          # list of (ring, shapely_poly)
+    holes_for = {}          # index into exteriors -> [hole rings]
+
+    for ring, sp in valid:
+        assigned = False
+        for j, (_ext_ring, ext_poly) in enumerate(exteriors):
+            if ext_poly.contains(sp):
+                holes_for.setdefault(j, []).append(ring)
+                assigned = True
+                break
+        if not assigned:
+            idx = len(exteriors)
+            exteriors.append((ring, sp))
+            holes_for[idx] = []
+
+    return [(ext_ring, holes_for[j]) for j, (ext_ring, _) in enumerate(exteriors)]
+
+
+def _rings_to_shapely(rings):
+    """Convert raw rings to a single Shapely geometry, respecting holes."""
+    specs = classify_rings(rings)
+    parts = []
+    for ext, holes in specs:
+        try:
+            p = ShapelyPolygon(
+                [(lng, lat) for lat, lng in ext],
+                [[(lng, lat) for lat, lng in h] for h in holes],
+            )
+            parts.append(p)
+        except Exception:
+            pass
+    if not parts:
+        return None
+    result = unary_union(parts)
+    if not result.is_valid:
+        result = result.buffer(0)
+    return result
+
+
 def build_adjacency(schools_with_boundaries):
     """Return adjacency sets using shapely polygon intersection.
 
@@ -116,13 +188,7 @@ def build_adjacency(schools_with_boundaries):
     for _s, rings in schools_with_boundaries:
         if rings:
             try:
-                from shapely.ops import unary_union
-                parts = [ShapelyPolygon([(lng, lat) for lat, lng in ring])
-                         for ring in rings if len(ring) >= 3]
-                p = unary_union(parts)
-                if not p.is_valid:
-                    p = p.buffer(0)
-                polys.append(p)
+                polys.append(_rings_to_shapely(rings))
             except Exception:
                 polys.append(None)
         else:
@@ -239,20 +305,31 @@ def build_kml(schools_with_boundaries, colors):
         "    <name>Catchment Boundaries</name>",
     ]
 
-    def polygon_kml(ring, indent):
+    def ring_coords(ring):
         if ring[0] != ring[-1]:
             ring = ring + [ring[0]]
-        coords = " ".join(f"{lng},{lat},0" for lat, lng in ring)
+        return " ".join(f"{lng},{lat},0" for lat, lng in ring)
+
+    def polygon_kml(ext, holes, indent):
         i = " " * indent
-        return [
+        lines = [
             f"{i}<Polygon>",
             f"{i}  <outerBoundaryIs>",
             f"{i}    <LinearRing>",
-            f"{i}      <coordinates>{coords}</coordinates>",
+            f"{i}      <coordinates>{ring_coords(ext)}</coordinates>",
             f"{i}    </LinearRing>",
             f"{i}  </outerBoundaryIs>",
-            f"{i}</Polygon>",
         ]
+        for hole in holes:
+            lines += [
+                f"{i}  <innerBoundaryIs>",
+                f"{i}    <LinearRing>",
+                f"{i}      <coordinates>{ring_coords(hole)}</coordinates>",
+                f"{i}    </LinearRing>",
+                f"{i}  </innerBoundaryIs>",
+            ]
+        lines.append(f"{i}</Polygon>")
+        return lines
 
     for (s, rings), color in zip(schools_with_boundaries, colors):
         if not rings:
@@ -263,12 +340,14 @@ def build_kml(schools_with_boundaries, colors):
             f"      <name>{escape_xml(s['name'])} - Boundary</name>",
             f"      <styleUrl>#{style_id}</styleUrl>",
         ]
-        if len(rings) == 1:
-            lines += polygon_kml(rings[0], indent=6)
+        poly_specs = classify_rings(rings)
+        if len(poly_specs) == 1:
+            ext, holes = poly_specs[0]
+            lines += polygon_kml(ext, holes, indent=6)
         else:
             lines.append("      <MultiGeometry>")
-            for ring in rings:
-                lines += polygon_kml(ring, indent=8)
+            for ext, holes in poly_specs:
+                lines += polygon_kml(ext, holes, indent=8)
             lines.append("      </MultiGeometry>")
         lines.append("    </Placemark>")
 
